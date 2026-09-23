@@ -1,0 +1,22 @@
+python3 - << 'PYEOF'
+import os, re
+p = os.path.expanduser("~/sgan/sgan_dup_official.py"); s = open(p).read()
+s, n1 = re.subn(r'ap\.add_argument\("--k", default="0,1,2,4,8"[^)]*\)', 'ap.add_argument("--k", default="0,1,2,4")', s, count=1)
+reps = [('open(f"{a.outdir}/summary.csv"', 'open(f"{a.outdir}/summary_{getattr(a, \'tag\', \'sgan\')}.csv"'),
+        ('open(f"{a.outdir}/per_pedestrian.csv"', 'open(f"{a.outdir}/per_pedestrian_{getattr(a, \'tag\', \'sgan\')}.csv"'),
+        ('xn = getattr(a, "xlsx", "sgan_dup_results.xlsx")', 'xn = f"dup_results_{getattr(a, \'tag\', \'sgan\')}.xlsx"'),
+        ('print(f"-> {a.outdir}/summary.csv, per_pedestrian.csv")',
+         'print(f"-> {a.outdir}/summary_{getattr(a, \'tag\', \'sgan\')}.csv, per_pedestrian_{getattr(a, \'tag\', \'sgan\')}.csv")')]
+for a_, b_ in reps:
+    assert a_ in s, f"SGAN: 못 찾음 {a_[:40]}"
+    s = s.replace(a_, b_, 1)
+assert n1 == 1, "SGAN: --k 줄을 못 찾음"
+open(p, "w").write(s); print("SGAN 수정 완료")
+
+p = os.path.expanduser("~/Social-STGCNN/stgcnn_dup_official.py"); t = open(p).read()
+old = 'a.label, a.xlsx, a.paper = "Social-STGCNN", "stgcnn_dup_results.xlsx", PAPER'
+assert old in t, "STGCNN: 못 찾음"
+open(p, "w").write(t.replace(old, 'a.label, a.tag, a.paper = "Social-STGCNN", "stgcnn", PAPER', 1)); print("STGCNN 수정 완료")
+PYEOF
+grep -n 'default="0,1,2,4"\|summary_' ~/sgan/sgan_dup_official.py | head -3
+grep -n 'a.tag' ~/Social-STGCNN/stgcnn_dup_official.py
