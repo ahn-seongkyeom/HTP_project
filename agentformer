@@ -1,0 +1,142 @@
+cat > ~/AgentFormer/agentformer_dup_official.py << 'PYEOF'
+# -*- coding: utf-8 -*-
+"""
+AgentFormer (DLow) 복제 실험 — 공개 사전학습 weight, SGAN·STGCNN 과 같은 장면·복제 방식
+  weight : ~/AgentFormer/results/<이름>_agentformer/models/
+  데이터 : ~/sgan/datasets/<이름>/test/*.txt  (10프레임, AgentFormer 데이터와 좌표 동일)
+  best   : 보행자마다 20개 중 최선 (공식 eval.py 와 동일)
+  z      : 공식 추론(mean=True)은 관측에서 잠재 z 20개를 계산. 복제 전 z 고정, 복제본은 A 의 z 복사
+"""
+import os, sys, time, importlib.util
+import numpy as np
+import torch
+
+AF_ROOT = os.path.expanduser("~/AgentFormer")
+PAPER = {"eth": (0.45, 0.75), "hotel": (0.14, 0.22), "univ": (0.25, 0.45),
+         "zara1": (0.18, 0.30), "zara2": (0.14, 0.24)}
+_sp = importlib.util.spec_from_file_location("sgan_dup_official", os.path.expanduser("~/sgan/sgan_dup_official.py"))
+M = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(M)
+OL, PL = M.OL, M.PL
+
+
+def load_model(name, dev):
+    os.chdir(AF_ROOT); sys.path.insert(0, AF_ROOT)
+    from utils.config import Config
+    from model.model_lib import model_dict
+    cfg = Config(f"{name}_agentformer", tmp=False, create_dirs=False)
+    mid = cfg.get("model_id", "agentformer")
+    if mid != "dlow":
+        raise RuntimeError(f"model_id 가 dlow 가 아님 ({mid})")
+    ep = cfg.get_last_epoch()
+    model = model_dict[mid](cfg)
+    cp = cfg.model_path % ep
+    model.load_state_dict(torch.load(cp, map_location="cpu")["model_dict"], strict=False)
+    model.set_device(dev); model.eval()
+    assert cfg.past_frames == OL and cfg.future_frames == PL
+    return model, cfg, cp
+
+
+def make_data(obs, gt, pids, ts):
+    n = obs.shape[1]
+    return {"pre_motion_3D": [torch.from_numpy(obs[:, j] / ts).float() for j in range(n)],
+            "fut_motion_3D": [torch.from_numpy(gt[:, j] / ts).float() for j in range(n)],
+            "pre_motion_mask": [torch.ones(OL) for _ in range(n)],
+            "fut_motion_mask": [torch.ones(PL) for _ in range(n)],
+            "heading": None, "valid_id": list(pids), "traj_scale": ts,
+            "pred_mask": None, "scene_map": None}
+
+
+def af_predict(model, obs, gt, pids, ts, z=None):
+    with torch.no_grad():
+        model.set_data(make_data(obs, gt, pids, ts))
+        d, pm = model.data, model.pred_model[0]
+        if getattr(pm, "use_map", False):
+            d["map_enc"] = pm.map_encoder(d["agent_maps"])
+        pm.context_encoder(d)
+        if z is None:
+            z = model.q_b(model.q_mlp(d["agent_context"])).view(-1, model.nz)
+        pm.future_decoder(d, mode="infer", sample_num=model.nk, autoregress=True, z=z)
+        out = d["infer_dec_motion"][..., :2] * ts
+    return out.permute(1, 2, 0, 3).cpu().numpy().astype(np.float64), z
+
+
+def run(name, a, dev):
+    print(f"\n{'#' * 84}\n[{name}]  AgentFormer")
+    try:
+        model, cfg, cp = load_model(name, dev)
+    except Exception as e:
+        print(f"  모델 불러오기 실패: {type(e).__name__}: {e}"); return None
+    ts, K = float(cfg.traj_scale), model.nk
+    print(f"  weight {cp}   traj_scale {ts}   샘플 {K}개")
+    scenes = M.make_scenes(name, a)
+    if not scenes:
+        return None
+    print(f"  복제 수 {a.ks}  sigma {a.sigmas}")
+    rows, rend, exact, t0 = [], [], 0.0, time.time()
+    for i, sc in enumerate(scenes):
+        if i and i % 100 == 0:
+            el = time.time() - t0
+            print(f"    장면 {i}/{len(scenes)}  경과 {el/60:.1f}분  남은 약 {el/i*(len(scenes)-i)/60:.1f}분", flush=True)
+        obs, gt, n, t = sc["traj"][:OL], sc["traj"][OL:], len(sc["pids"]), sc["t"]
+        pids = list(sc["pids"])
+        pa, z0 = af_predict(model, obs, gt, pids, ts)
+        e0 = np.linalg.norm(pa - gt[None], axis=-1)
+        ka, kf = e0.mean(1).argmin(0), e0[:, -1].argmin(0)
+        jj = np.arange(n)
+        ade0, fde0 = e0.mean(1)[ka, jj], e0[:, -1][kf, jj]
+        zt = z0[t * K:(t + 1) * K]
+        ff = sc["frames"]
+        for k, sg in a.configs:
+            if k == 0:
+                pb, aug = pa, obs
+            else:
+                aug = M.augment(obs, t, k, sg, sc["u_dup"])
+                gt_aug = np.concatenate([gt, np.repeat(gt[:, t:t + 1], k, axis=1)], axis=1)
+                z_aug = torch.cat([z0] + [zt] * k, 0)
+                out, _ = af_predict(model, aug, gt_aug, pids + [10 ** 6 + c for c in range(k)], ts, z=z_aug)
+                pb = out[:, :, :n]
+                if sg == 0:
+                    exact = max(exact, float(np.abs(pb - pa).max()))
+            e = np.linalg.norm(pb - gt[None], axis=-1)
+            ade1, fde1 = e.mean(1)[ka, jj], e[:, -1][kf, jj]
+            for j, pid in enumerate(sc["pids"]):
+                rows.append([name, sc["src"], pid, int(ff[0]), int(ff[OL - 1]), int(ff[-1]), k, sg,
+                             "source" if j == t else "other",
+                             float(ade0[j]), float(fde0[j]), float(ade1[j]), float(fde1[j]),
+                             float(ade1[j] - ade0[j]), float(fde1[j] - fde0[j])])
+            if (k, sg) == (a.video_k, a.video_sigma):
+                rend.append(dict(src=sc["src"], frames=ff, obs=obs, ghost=aug[:, n:],
+                                 pa=pa[ka, :, jj].transpose(1, 0, 2), pb=pb[ka, :, jj].transpose(1, 0, 2)))
+    summ = M.summarize(name, rows, a)
+    print(f"  완전 복제(sigma=0) 시 원래 사람 예측의 최대 변화: {exact:.2e} m")
+    k0 = [s for s in summ if s[1] == 0 and s[3] == "all"][0]
+    p = PAPER.get(name)
+    print(f"  [기존 ADE/FDE]  여기 {k0[5]:.4f} / {k0[6]:.4f}" + (f"   논문 {p[0]:.2f} / {p[1]:.2f}" if p else ""))
+    if not a.novideo and rend:
+        M.render(name, rend, a)
+    return rows, summ
+
+
+if __name__ == "__main__":
+    sys.argv = [x for x in sys.argv if x != "--official"]
+    a = M.parse_args()
+    a.weights = "author"
+    a.label, a.tag, a.paper = "AgentFormer", "agentformer", PAPER
+    a.data_root = M.SGAN_ROOT
+    a.outdir = os.path.join(AF_ROOT, "results_dup",
+                            f"author_k{'-'.join(map(str, a.ks))}_stride{a.stride}{'_strict' if a.strict else ''}")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"weight: results/ (공개 사전학습)\n복제 수 k: {a.ks}   sigma: {a.sigmas}   "
+          f"장면 솎아내기: 1/{a.stride}   간격 끊긴 구간: {'제외' if a.strict else '포함(공식과 동일)'}\n결과: {a.outdir}")
+    R, S = [], []
+    for n in a.datasets:
+        r = run(n, a, dev)
+        if r:
+            R += r[0]; S += r[1]
+    if R:
+        M.save(R, S, a)
+PYEOF
+python3 -c "import ast; ast.parse(open('$HOME/AgentFormer/agentformer_dup_official.py').read()); print('AgentFormer 파일 OK')"
