@@ -1,0 +1,421 @@
+cat > ~/sgan/sgan_dup_official.py << 'PYEOF'
+# -*- coding: utf-8 -*-
+"""
+SGAN 20VP-20 (max pooling) 복제 실험 — SGAN 공식 평가(evaluate_model.py)와 같은 장면 규칙
+장면마다 무작위 1명(A)의 관측 궤적에 N(0, sigma^2) 을 더한 복제본을 k 개 추가하고,
+원래 사람들의 ADE/FDE 가 얼마나 바뀌는지 본다 (복제본은 평가에서 제외).
+best z 는 복제 전(k=0)에서 장면 단위로 고르고(evaluate_model.py 와 동일) 고정한다.
+데이터: ~/sgan/datasets/<이름>/test/*.txt (10프레임, 학습 조건과 동일)
+weight: --weights author -> ~/sgan/ckpt_author/,  own -> ~/sgan/ckpt/
+"""
+import os, sys, csv, time, argparse
+import numpy as np
+import torch
+
+SGAN_ROOT = os.path.expanduser("~/sgan")
+DATA      = os.path.join(SGAN_ROOT, "data")
+SEED      = 0
+K_SAMPLES = 20
+OL, PL    = 8, 12
+MIN_PED   = 1
+MAX_PEDS  = 25
+VIDEO     = {
+  "eth":   dict(video="eth/seq_eth.avi",          H="eth/H.txt",                  swap=True,  fps=15),
+  "hotel": dict(video="hotel/seq_hotel.avi",      H="hotel/H.txt",                swap=True,  fps=25),
+  "univ":  dict(video="students/students003.avi", H="students/students003_H.txt", swap=False, fps=25),
+  "zara1": dict(video="zara/crowds_zara01.avi",   H="zara/zara1_H.txt",           swap=False, fps=25),
+  "zara2": dict(video="zara/crowds_zara02.avi",   H="zara/zara2_H.txt",           swap=False, fps=25),
+}
+DATASETS = list(VIDEO)
+PAPER_20VP20 = {"eth": (0.87, 1.62), "hotel": (0.67, 1.37), "univ": (0.76, 1.52),
+                "zara1": (0.35, 0.68), "zara2": (0.42, 0.84)}
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("datasets", nargs="*", default=DATASETS)
+    ap.add_argument("--k", default="0,1,2,4,8")
+    ap.add_argument("--sigma", default="0,0.02,0.05")
+    ap.add_argument("--weights", default="author", choices=["author", "own"])
+    ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--official", action="store_true")
+    ap.add_argument("--video_k", type=int, default=None)
+    ap.add_argument("--video_sigma", type=float, default=0.02)
+    ap.add_argument("--novideo", action="store_true")
+    a = ap.parse_args()
+    a.ks = sorted({0} | {int(x) for x in a.k.split(",")})
+    a.sigmas = [float(x) for x in a.sigma.split(",")]
+    a.configs = [(0, 0.0)] + [(k, s) for k in a.ks if k > 0 for s in a.sigmas]
+    if a.video_k is None:
+        a.video_k = max(a.ks)
+    a.ckdir = os.path.join(SGAN_ROOT, "ckpt_author" if a.weights == "author" else "ckpt")
+    a.outdir = os.path.join(SGAN_ROOT, "results_dup",
+                            f"{a.weights}_k{'-'.join(map(str, a.ks))}_stride{a.stride}{'_strict' if a.strict else ''}")
+    return a
+
+
+def load_test_files(name, root=SGAN_ROOT):
+    d = os.path.join(root, "datasets", name, "test")
+    return [(f[:-4], os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".txt")]
+
+
+def build_scenes(arr, strict=False):
+    d = np.around(arr, 4)
+    L = OL + PL
+    frames = np.unique(d[:, 0])
+    step = int(np.median(np.diff(frames))) if len(frames) > 1 else 0
+    rows = {f: d[d[:, 0] == f] for f in frames}
+    out = []
+    for i in range(0, max(len(frames) - L + 1, 0)):
+        win = frames[i:i + L]
+        if strict and int(round(win[-1] - win[0])) != step * (L - 1):
+            continue
+        seg = np.concatenate([rows[f] for f in win], 0)
+        ids, tr = [], []
+        for pid in np.unique(seg[:, 1]):
+            s = seg[seg[:, 1] == pid]
+            s = s[np.argsort(s[:, 0])]
+            if s[0, 0] != win[0] or s[-1, 0] != win[-1] or len(s) != L:
+                continue
+            ids.append(int(pid)); tr.append(s[:, 2:4])
+        if len(ids) > MIN_PED:
+            out.append(dict(frames=win.astype(int), pids=ids, traj=np.stack(tr, 1)))
+    return out, step
+
+
+def make_scenes(name, a):
+    rng = np.random.default_rng(SEED)
+    trng = np.random.default_rng(SEED + 7)
+    kmax = max(a.ks) if max(a.ks) > 0 else 1
+    scenes = []
+    root = getattr(a, "data_root", SGAN_ROOT)
+    for src, path in load_test_files(name, root):
+        sc_, step = build_scenes(np.loadtxt(path)[:, :4], a.strict)
+        sc_ = sc_[::a.stride]
+        print(f"  {os.path.relpath(path, root)}: 간격 {step}프레임, 장면 {len(sc_)}"
+              f" (1/{a.stride}), 보행자-창 {sum(len(s['pids']) for s in sc_)}")
+        for sc in sc_:
+            sc["src"] = src
+            sc["t"] = int(trng.integers(len(sc["pids"])))
+            sc["u_dup"] = rng.standard_normal((kmax, OL, 2))
+            scenes.append(sc)
+    return scenes
+
+
+def augment(obs, t, k, sg, u_dup):
+    if k == 0:
+        return obs
+    dup = obs[:, t][None] + sg * u_dup[:k]
+    return np.concatenate([obs, dup.transpose(1, 0, 2)], axis=1)
+
+
+def load_generator(path):
+    from attrdict import AttrDict
+    from sgan.models import TrajectoryGenerator
+    ck = torch.load(path, map_location="cpu")
+    g_args = AttrDict(ck["args"])
+    g = TrajectoryGenerator(
+        obs_len=g_args.obs_len, pred_len=g_args.pred_len,
+        embedding_dim=g_args.embedding_dim, encoder_h_dim=g_args.encoder_h_dim_g,
+        decoder_h_dim=g_args.decoder_h_dim_g, mlp_dim=g_args.mlp_dim,
+        num_layers=g_args.num_layers, noise_dim=g_args.noise_dim, noise_type=g_args.noise_type,
+        noise_mix_type=g_args.noise_mix_type, pooling_type=g_args.pooling_type,
+        pool_every_timestep=g_args.pool_every_timestep, dropout=g_args.dropout,
+        bottleneck_dim=g_args.bottleneck_dim, neighborhood_size=g_args.neighborhood_size,
+        grid_size=g_args.grid_size, batch_norm=g_args.batch_norm)
+    g.load_state_dict(ck["g_state"]); g.eval()
+    g.cuda()
+    return g, g_args
+
+
+def predict(g, A, obs_np, zs):
+    from sgan.utils import relative_to_abs
+    dev = next(g.parameters()).device
+    Kz, n = zs.shape[0], obs_np.shape[1]
+    obs = torch.tensor(obs_np, dtype=torch.float32, device=dev).repeat(1, Kz, 1)
+    rel = torch.zeros_like(obs); rel[1:] = obs[1:] - obs[:-1]
+    se = torch.tensor([[k * n, (k + 1) * n] for k in range(Kz)], device=dev)
+    z = zs if A.noise_mix_type == "global" else zs.repeat_interleave(n, 0)
+    out = relative_to_abs(g(obs, rel, se, user_noise=z), obs[-1])
+    return out.view(out.size(0), Kz, n, 2).permute(1, 0, 2, 3).cpu().numpy()
+
+
+def official_counts(name, ck):
+    from sgan.data.trajectories import TrajectoryDataset
+    a_ = torch.load(ck, map_location="cpu")["args"]
+    d = TrajectoryDataset(os.path.join(SGAN_ROOT, "datasets", name, "test"),
+                          obs_len=a_["obs_len"], pred_len=a_["pred_len"],
+                          skip=a_["skip"], delim=a_["delim"])
+    return int(d.num_seq), int(d.obs_traj.shape[0])
+
+
+def official_eval(ck, num_samples=K_SAMPLES):
+    import importlib.util
+    from attrdict import AttrDict
+    from sgan.data.loader import data_loader
+    from sgan.utils import get_dset_path
+    sp = importlib.util.spec_from_file_location("evaluate_model", os.path.join(SGAN_ROOT, "scripts", "evaluate_model.py"))
+    em = importlib.util.module_from_spec(sp); sp.loader.exec_module(em)
+    cp = torch.load(ck)
+    gen = em.get_generator(cp)
+    _args = AttrDict(cp["args"])
+    _, loader = data_loader(_args, get_dset_path(_args.dataset_name, "test"))
+    ade, fde = em.evaluate(_args, loader, gen, num_samples)
+    return float(ade), float(fde)
+
+
+def run(name, a):
+    ck = os.path.join(a.ckdir, f"{name}_20VP_with_model.pt")
+    print(f"\n{'#' * 84}\n[{name}]  weight {os.path.relpath(ck, SGAN_ROOT)}")
+    if not os.path.exists(ck):
+        print("  weight 없음"); return None
+    scenes = make_scenes(name, a)
+    if not scenes:
+        return None
+    try:
+        n_seq, n_ped = official_counts(name, ck)
+        mine_ped = sum(len(s["pids"]) for s in scenes)
+        tag = "일치" if (a.stride == 1 and not a.strict and n_seq == len(scenes) and n_ped == mine_ped) else "(다름)"
+        print(f"  [공식 로더 대조] 공식 장면 {n_seq}, 보행자-창 {n_ped}  /  여기 장면 {len(scenes)}, 보행자-창 {mine_ped}  -> {tag}")
+    except Exception as e:
+        print(f"  [공식 로더 대조] 생략 ({type(e).__name__}: {e})")
+    torch.manual_seed(SEED)
+    g, A = load_generator(ck)
+    print(f"  pooling={A.pooling_type}  best_k={A.best_k}  복제 수 {a.ks}  sigma {a.sigmas}")
+    if A.pooling_type != "pool_net":
+        print("  [주의] max pooling(pool_net) 모델이 아닙니다")
+    dev = next(g.parameters()).device
+    rows, rend, exact = [], [], 0.0
+    t0 = time.time()
+    with torch.no_grad():
+        for i, sc in enumerate(scenes):
+            if i and i % 50 == 0:
+                el = time.time() - t0
+                print(f"    장면 {i}/{len(scenes)}  경과 {el/60:.1f}분  남은 약 {el/i*(len(scenes)-i)/60:.1f}분", flush=True)
+            obs, gt, n, t = sc["traj"][:OL], sc["traj"][OL:], len(sc["pids"]), sc["t"]
+            zs = torch.randn(K_SAMPLES, *A.noise_dim, device=dev)
+            pa = predict(g, A, obs, zs)
+            ea = np.linalg.norm(pa - gt[None], axis=-1)
+            k_ade, k_fde = int(ea.sum(1).sum(1).argmin()), int(ea[:, -1].sum(1).argmin())
+            idx = sorted({k_ade, k_fde}); z_fix = zs[idx]
+            ia, jf = idx.index(k_ade), idx.index(k_fde)
+            base = predict(g, A, obs, z_fix)
+            e0 = np.linalg.norm(base - gt[None], axis=-1)
+            ade0, fde0 = e0[ia].mean(0), e0[jf, -1]
+            ff = sc["frames"]
+            for k, sg in a.configs:
+                if k == 0:
+                    pb, aug = base, obs
+                else:
+                    aug = augment(obs, t, k, sg, sc["u_dup"])
+                    pb = predict(g, A, aug, z_fix)[:, :, :n]
+                    if sg == 0:
+                        exact = max(exact, float(np.abs(pb - base).max()))
+                e = np.linalg.norm(pb - gt[None], axis=-1)
+                ade1, fde1 = e[ia].mean(0), e[jf, -1]
+                for j, pid in enumerate(sc["pids"]):
+                    rows.append([name, sc["src"], pid, int(ff[0]), int(ff[OL - 1]), int(ff[-1]), k, sg,
+                                 "source" if j == t else "other",
+                                 float(ade0[j]), float(fde0[j]), float(ade1[j]), float(fde1[j]),
+                                 float(ade1[j] - ade0[j]), float(fde1[j] - fde0[j])])
+                if (k, sg) == (a.video_k, a.video_sigma):
+                    rend.append(dict(src=sc["src"], frames=ff, obs=obs, ghost=aug[:, n:],
+                                     pa=base[ia], pb=pb[ia]))
+    summ = summarize(name, rows, a)
+    print(f"  완전 복제(sigma=0) 시 원래 사람 예측의 최대 변화: {exact:.2e} m")
+    k0 = [s_ for s_ in summ if s_[1] == 0 and s_[3] == "all"][0]
+    p = PAPER_20VP20.get(name)
+    line = f"  [기존 ADE/FDE]  여기 {k0[5]:.4f} / {k0[6]:.4f}"
+    if p:
+        line += f"   논문 {p[0]:.2f} / {p[1]:.2f}"
+    if a.official:
+        try:
+            oa, of = official_eval(ck)
+            line += f"   공식 evaluate_model {oa:.4f} / {of:.4f}"
+        except Exception as e:
+            line += f"   (공식 평가 실패: {type(e).__name__})"
+    print(line)
+    if not a.novideo and rend:
+        render(name, rend, a)
+    return rows, summ
+
+
+ROLES = ("all", "source", "other")
+HDR = ["dataset", "source", "ped_id", "frame_start", "frame_obs_end", "frame_end", "k", "sigma", "role",
+       "기존ADE", "기존FDE", "만든ADE", "만든FDE", "ADE차이", "FDE차이"]
+SHDR = ["dataset", "k", "sigma", "role", "건수", "기존ADE", "기존FDE", "만든ADE", "만든FDE",
+        "ADE차이", "FDE차이", "|ADE차이|", "|FDE차이|"]
+
+
+def table(summ, a):
+    print(f"\n  {'k':>3} {'sigma':>6} | {'전체 기존ADE':>11} {'만든ADE':>8} {'차이':>8} | "
+          f"{'기존FDE':>8} {'만든FDE':>8} {'차이':>8} | {'나머지|ΔADE|':>12}")
+    for k, sg in a.configs:
+        al = [s for s in summ if s[1] == k and s[2] == sg and s[3] == "all"]
+        ot = [s for s in summ if s[1] == k and s[2] == sg and s[3] == "other"]
+        if al:
+            x = al[0]
+            print(f"  {k:>3} {sg:>6} | {x[5]:>11.4f} {x[7]:>8.4f} {x[9]:>+8.4f} | "
+                  f"{x[6]:>8.4f} {x[8]:>8.4f} {x[10]:>+8.4f} | {(ot[0][11] if ot else 0):>12.4f}")
+
+
+def summarize(name, rows, a):
+    summ = []
+    for k, sg in a.configs:
+        for role in ROLES:
+            sel = [r[9:] for r in rows if r[6] == k and r[7] == sg and (role == "all" or r[8] == role)]
+            if sel:
+                M = np.array(sel, float)
+                summ.append([name, k, sg, role, len(M)] + list(M.mean(0)) +
+                            [float(np.abs(M[:, 4]).mean()), float(np.abs(M[:, 5]).mean())])
+    table(summ, a)
+    return summ
+
+
+def save(all_rows, all_summ, a):
+    os.makedirs(a.outdir, exist_ok=True)
+    label = getattr(a, "label", "SGAN-20VP")
+    avg = []
+    for k, sg in a.configs:
+        for role in ROLES:
+            ms = np.array([s[5:] for s in all_summ if s[1] == k and s[2] == sg and s[3] == role], float)
+            if len(ms):
+                n = int(sum(s[4] for s in all_summ if s[1] == k and s[2] == sg and s[3] == role))
+                avg.append(["AVG", k, sg, role, n] + list(ms.mean(0)))
+    with open(f"{a.outdir}/summary.csv", "w", newline="", encoding="utf-8-sig") as fo:
+        w = csv.writer(fo); w.writerow(SHDR)
+        for s in all_summ + avg:
+            w.writerow(s[:5] + [f"{v:.6f}" for v in s[5:]])
+    with open(f"{a.outdir}/per_pedestrian.csv", "w", newline="", encoding="utf-8-sig") as fo:
+        w = csv.writer(fo); w.writerow(HDR)
+        for r in all_rows:
+            w.writerow(r[:9] + [f"{v:.6f}" for v in r[9:]])
+    try:
+        from openpyxl import Workbook
+        from openpyxl.chart import LineChart, Reference
+        wb = Workbook(); ws = wb.active; ws.title = "summary"
+        ws.append(SHDR)
+        for s in all_summ + avg:
+            ws.append(s[:5] + [round(v, 5) for v in s[5:]])
+        ch = wb.create_sheet("chart")
+        for c0, (title, idx, role) in enumerate([("전체 ADE 차이", 9, "all"), ("전체 FDE 차이", 10, "all"),
+                                                 ("나머지 |ADE차이|", 11, "other")]):
+            r0 = 1 + c0 * (len(a.ks) + 4)
+            ch.cell(r0, 1, f"{label} ({a.weights})  {title} — 데이터셋 평균")
+            ch.cell(r0 + 1, 1, "k")
+            for c, sg in enumerate(a.sigmas):
+                ch.cell(r0 + 1, 2 + c, f"sigma={sg}")
+            for i, k in enumerate(a.ks):
+                ch.cell(r0 + 2 + i, 1, k)
+                for c, sg in enumerate(a.sigmas):
+                    kk, ss = (0, 0.0) if k == 0 else (k, sg)
+                    v = [x for x in avg if x[1] == kk and x[2] == ss and x[3] == role]
+                    ch.cell(r0 + 2 + i, 2 + c, round(v[0][idx], 5) if v else None)
+            lc = LineChart(); lc.title = title; lc.x_axis.title = "복제 수 k"; lc.y_axis.title = "m"
+            lc.add_data(Reference(ch, min_col=2, max_col=1 + len(a.sigmas), min_row=r0 + 1,
+                                  max_row=r0 + 1 + len(a.ks)), titles_from_data=True)
+            lc.set_categories(Reference(ch, min_col=1, min_row=r0 + 2, max_row=r0 + 1 + len(a.ks)))
+            lc.height, lc.width = 7, 13
+            ch.add_chart(lc, f"{chr(ord('A') + len(a.sigmas) + 2)}{r0}")
+        for n in dict.fromkeys(r[0] for r in all_rows):
+            sh = wb.create_sheet(n); sh.append(HDR)
+            for r in all_rows:
+                if r[0] == n:
+                    sh.append(r[:9] + [round(v, 6) for v in r[9:]])
+        xn = getattr(a, "xlsx", "sgan_dup_results.xlsx")
+        wb.save(f"{a.outdir}/{xn}")
+        print(f"-> {a.outdir}/{xn}")
+    except ImportError:
+        print("  openpyxl 없음 -> csv 로만 저장")
+    print(f"-> {a.outdir}/summary.csv, per_pedestrian.csv")
+    print(f"\n{'=' * 96}\n{label} ({a.weights} weight)  복제 실험 — 데이터셋 평균, 원래 사람들만 평가 (m)")
+    table(avg, a)
+    print("\n데이터셋별 기존(k=0) ADE / FDE")
+    for s in all_summ:
+        if s[1] == 0 and s[3] == "all":
+            p = getattr(a, "paper", PAPER_20VP20).get(s[0], (float("nan"), float("nan")))
+            print(f"  {s[0]:<6} 여기 {s[5]:.4f} / {s[6]:.4f}    논문 {p[0]:.2f} / {p[1]:.2f}   ({s[4]}건)")
+
+
+def render(name, items, a):
+    import cv2
+    cfg = VIDEO[name]
+    vp, hp = os.path.join(DATA, cfg["video"]), os.path.join(DATA, cfg["H"])
+    if not (os.path.exists(vp) and os.path.exists(hp)):
+        print(f"  영상/H 없음 -> 오버레이 생략 ({vp})"); return
+    out = os.path.join(a.outdir, name); os.makedirs(out, exist_ok=True)
+    Hi = np.linalg.inv(np.loadtxt(hp))
+    def w2p(w):
+        w = np.asarray(w, float).reshape(-1, 2)
+        h = np.c_[w, np.ones(len(w))] @ Hi.T
+        p = h[:, :2] / h[:, 2:3]
+        return p[:, ::-1] if cfg["swap"] else p
+    cap = cv2.VideoCapture(vp)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    NF = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); cap.release()
+    WH, YE, RD, MG = (255, 255, 255), (0, 255, 255), (60, 60, 255), (255, 0, 255)
+    F = cv2.FONT_HERSHEY_SIMPLEX
+    def text(img, t, org, color):
+        (tw, th), bl = cv2.getTextSize(t, F, 0.42, 1); x, y = org
+        img[max(0, y-th-4):y+bl+3, max(0, x-4):x+tw+4] = (img[max(0, y-th-4):y+bl+3, max(0, x-4):x+tw+4]*0.3).astype(img.dtype)
+        cv2.putText(img, t, (x, y), F, 0.42, color, 1, cv2.LINE_AA)
+    def Q(p):
+        return np.round(p).astype(np.int32).reshape(-1, 1, 2)
+    by = {}
+    for r in items:
+        by.setdefault(r["src"], {})[int(r["frames"][OL - 1])] = r
+    keys = {s: np.array(sorted(v)) for s, v in by.items()}
+    cache = {}
+    def px(r):
+        if id(r) not in cache:
+            cache[id(r)] = {q: w2p(r[q].reshape(-1, 2)).reshape(r[q].shape) for q in ("obs", "ghost", "pa", "pb")}
+        return cache[id(r)]
+    path = f"{out}/dup_k{a.video_k}_sigma{a.video_sigma}.mp4"
+    wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), cfg["fps"], (W, H))
+    cap = cv2.VideoCapture(vp)
+    legend = [("original observed 8", WH), ("prediction before duplication (best z)", YE),
+              ("prediction after duplication (same z)", RD),
+              (f"{a.video_k} near-duplicates of 1 ped, N(0,{a.video_sigma}^2)", MG)]
+    for f in range(NF):
+        ok, v = cap.read()
+        if not ok:
+            break
+        for s, kk in keys.items():
+            i = np.searchsorted(kk, f, side="right") - 1
+            if i < 0 or f > by[s][int(kk[i])]["frames"][-1]:
+                continue
+            p = px(by[s][int(kk[i])])
+            for gi in range(p["ghost"].shape[1]):
+                cv2.polylines(v, [Q(p["ghost"][:, gi])], False, MG, 1, cv2.LINE_AA)
+            for j in range(min(p["obs"].shape[1], MAX_PEDS)):
+                o, pa_, pb_ = p["obs"][:, j], p["pa"][:, j], p["pb"][:, j]
+                cv2.polylines(v, [Q(o)], False, WH, 2, cv2.LINE_AA)
+                cv2.polylines(v, [Q(np.vstack([o[-1:], pa_]))], False, YE, 2, cv2.LINE_AA)
+                cv2.polylines(v, [Q(np.vstack([o[-1:], pb_]))], False, RD, 2, cv2.LINE_AA)
+                cv2.circle(v, tuple(Q(pa_[-1])[0, 0]), 4, YE, -1)
+                cv2.circle(v, tuple(Q(pb_[-1])[0, 0]), 4, RD, -1)
+        for jj, (t, c) in enumerate(legend):
+            text(v, t, (12, 22 + jj * 19), c)
+        text(v, f"{getattr(a, 'label', 'SGAN-20VP')}  {name}  frame {f}", (W - 260, 22), (225, 225, 225))
+        wr.write(v)
+    cap.release(); wr.release()
+    print(f"  -> {path}")
+
+
+if __name__ == "__main__":
+    a = parse_args()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    print(f"weight: {a.ckdir}\n복제 수 k: {a.ks}   sigma: {a.sigmas}   장면 솎아내기: 1/{a.stride}"
+          f"   간격 끊긴 구간: {'제외' if a.strict else '포함(공식과 동일)'}\n결과: {a.outdir}")
+    R, S = [], []
+    for n in a.datasets:
+        r = run(n, a)
+        if r:
+            R += r[0]; S += r[1]
+    if R:
+        save(R, S, a)
+PYEOF
+python3 -c "import ast; ast.parse(open('$HOME/sgan/sgan_dup_official.py').read()); print('SGAN 파일 OK')"
