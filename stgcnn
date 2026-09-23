@@ -1,0 +1,175 @@
+cat > ~/Social-STGCNN/stgcnn_dup_official.py << 'PYEOF'
+# -*- coding: utf-8 -*-
+"""
+Social-STGCNN 복제 실험 — 저장소 포함 저자 weight, 공식 test.py 와 같은 규칙
+  weight : ~/Social-STGCNN/checkpoint/social-stgcnn-<이름>/val_best.pth (+ args.pkl)
+  데이터 : ~/Social-STGCNN/datasets/<이름>/test/*.txt
+  best   : 보행자마다 20개 중 최선 (공식 test.py 와 동일)
+  z      : 가우시안 샘플링의 표준정규 난수 eps 를 복제 전후로 고정
+"""
+import os, sys, pickle, time, importlib.util
+import numpy as np
+import torch
+
+STG_ROOT = os.path.expanduser("~/Social-STGCNN")
+FAST_GRAPH = True
+K_SAMPLES = 20
+PAPER = {"eth": (0.64, 1.11), "hotel": (0.49, 0.85), "univ": (0.44, 0.79),
+         "zara1": (0.34, 0.53), "zara2": (0.30, 0.48)}
+_sp = importlib.util.spec_from_file_location("sgan_dup_official", os.path.expanduser("~/sgan/sgan_dup_official.py"))
+M = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(M)
+OL, PL = M.OL, M.PL
+sys.path.insert(0, STG_ROOT)
+
+
+def load_model(name, dev):
+    from model import social_stgcnn
+    exp = f"{STG_ROOT}/checkpoint/social-stgcnn-{name}"
+    with open(f"{exp}/args.pkl", "rb") as fo:
+        args = pickle.load(fo)
+    m = social_stgcnn(n_stgcnn=args.n_stgcnn, n_txpcnn=args.n_txpcnn,
+                      output_feat=args.output_size, seq_len=args.obs_seq_len,
+                      kernel_size=args.kernel_size, pred_seq_len=args.pred_seq_len)
+    m.load_state_dict(torch.load(f"{exp}/val_best.pth", map_location="cpu"))
+    m.eval().to(dev)
+    assert args.obs_seq_len == OL and args.pred_seq_len == PL
+    return m, f"{exp}/val_best.pth"
+
+
+def fast_graph(seq, rel):
+    r = rel.transpose(2, 0, 1)
+    d = np.linalg.norm(r[:, :, None, :] - r[:, None, :, :], axis=-1)
+    with np.errstate(divide="ignore"):
+        A = np.where(d == 0, 0.0, 1.0 / d)
+    i = np.arange(A.shape[1]); A[:, i, i] = 1.0
+    deg = A.sum(-1)
+    with np.errstate(divide="ignore"):
+        dh = 1.0 / np.sqrt(deg)
+    dh[~np.isfinite(dh)] = 0.0
+    Lp = np.eye(A.shape[1])[None] * deg[:, :, None] - A
+    Lp = dh[:, :, None] * Lp * dh[:, None, :]
+    return torch.from_numpy(r.copy()).float(), torch.from_numpy(Lp).float()
+
+
+def graph(seq, rel):
+    if FAST_GRAPH:
+        return fast_graph(seq, rel)
+    from utils import seq_to_graph
+    return seq_to_graph(seq, rel, True)
+
+
+def params(model, obs, dev):
+    seq = obs.transpose(1, 2, 0).astype(np.float64)
+    rel = np.zeros_like(seq); rel[:, :, 1:] = seq[:, :, 1:] - seq[:, :, :-1]
+    V, A = graph(seq, rel)
+    V = V.float().unsqueeze(0).permute(0, 3, 1, 2).to(dev)
+    with torch.no_grad():
+        out, _ = model(V, A.float().to(dev))
+    out = out.permute(0, 2, 3, 1)[0].cpu().numpy().astype(np.float64)
+    return out[..., :2], np.exp(out[..., 2]), np.exp(out[..., 3]), np.tanh(out[..., 4])
+
+
+def sample_abs(mean, sx, sy, corr, eps, last):
+    L21 = corr * sy
+    L22 = sy * np.sqrt(np.clip(1.0 - corr ** 2, 0.0, None))
+    dx = sx[None] * eps[..., 0]
+    dy = L21[None] * eps[..., 0] + L22[None] * eps[..., 1]
+    return np.cumsum(mean[None] + np.stack([dx, dy], -1), axis=1) + last[None, None]
+
+
+def check_graph(scenes):
+    if not FAST_GRAPH:
+        return
+    try:
+        from utils import seq_to_graph
+    except Exception as e:
+        print(f"  [그래프 검사] 생략 ({type(e).__name__})"); return
+    worst = 0.0
+    for sc in scenes[:5]:
+        obs = M.augment(sc["traj"][:OL], sc["t"], 4, 0.02, sc["u_dup"])
+        seq = obs.transpose(1, 2, 0).astype(np.float64)
+        rel = np.zeros_like(seq); rel[:, :, 1:] = seq[:, :, 1:] - seq[:, :, :-1]
+        V1, A1 = seq_to_graph(seq, rel, True)
+        V2, A2 = fast_graph(seq, rel)
+        worst = max(worst, float((V1 - V2).abs().max()), float((A1 - A2).abs().max()))
+    print(f"  [그래프 검사] 원래 seq_to_graph 와 최대 차이 {worst:.2e}  (1e-5 이하면 동일)")
+
+
+def run(name, a, dev):
+    print(f"\n{'#' * 84}\n[{name}]  Social-STGCNN")
+    try:
+        model, ck = load_model(name, dev)
+    except FileNotFoundError as e:
+        print(f"  weight 없음: {e}"); return None
+    print(f"  weight {os.path.relpath(ck, STG_ROOT)}")
+    scenes = M.make_scenes(name, a)
+    if not scenes:
+        return None
+    check_graph(scenes)
+    print(f"  복제 수 {a.ks}  sigma {a.sigmas}")
+    rng = np.random.default_rng(M.SEED + 1)
+    rows, rend, exact, t0 = [], [], 0.0, time.time()
+    for i, sc in enumerate(scenes):
+        if i and i % 100 == 0:
+            el = time.time() - t0
+            print(f"    장면 {i}/{len(scenes)}  경과 {el/60:.1f}분  남은 약 {el/i*(len(scenes)-i)/60:.1f}분", flush=True)
+        obs, gt, n, t = sc["traj"][:OL], sc["traj"][OL:], len(sc["pids"]), sc["t"]
+        eps = rng.standard_normal((K_SAMPLES, PL, n, 2))
+        pa = sample_abs(*params(model, obs, dev), eps, obs[-1])
+        e0 = np.linalg.norm(pa - gt[None], axis=-1)
+        ka, kf = e0.mean(1).argmin(0), e0[:, -1].argmin(0)
+        jj = np.arange(n)
+        ade0, fde0 = e0.mean(1)[ka, jj], e0[:, -1][kf, jj]
+        ff = sc["frames"]
+        for k, sg in a.configs:
+            if k == 0:
+                pb, aug = pa, obs
+            else:
+                aug = M.augment(obs, t, k, sg, sc["u_dup"])
+                prm = tuple(x[:, :n] for x in params(model, aug, dev))
+                pb = sample_abs(*prm, eps, obs[-1])
+                if sg == 0:
+                    exact = max(exact, float(np.abs(pb - pa).max()))
+            e = np.linalg.norm(pb - gt[None], axis=-1)
+            ade1, fde1 = e.mean(1)[ka, jj], e[:, -1][kf, jj]
+            for j, pid in enumerate(sc["pids"]):
+                rows.append([name, sc["src"], pid, int(ff[0]), int(ff[OL - 1]), int(ff[-1]), k, sg,
+                             "source" if j == t else "other",
+                             float(ade0[j]), float(fde0[j]), float(ade1[j]), float(fde1[j]),
+                             float(ade1[j] - ade0[j]), float(fde1[j] - fde0[j])])
+            if (k, sg) == (a.video_k, a.video_sigma):
+                rend.append(dict(src=sc["src"], frames=ff, obs=obs, ghost=aug[:, n:],
+                                 pa=pa[ka, :, jj].transpose(1, 0, 2), pb=pb[ka, :, jj].transpose(1, 0, 2)))
+    summ = M.summarize(name, rows, a)
+    print(f"  완전 복제(sigma=0) 시 원래 사람 예측의 최대 변화: {exact:.2e} m")
+    k0 = [s for s in summ if s[1] == 0 and s[3] == "all"][0]
+    p = PAPER.get(name)
+    print(f"  [기존 ADE/FDE]  여기 {k0[5]:.4f} / {k0[6]:.4f}" + (f"   논문 {p[0]:.2f} / {p[1]:.2f}" if p else ""))
+    if not a.novideo and rend:
+        M.render(name, rend, a)
+    return rows, summ
+
+
+if __name__ == "__main__":
+    sys.argv = [x for x in sys.argv if x != "--official"]
+    a = M.parse_args()
+    a.weights = "author"
+    a.label, a.xlsx, a.paper = "Social-STGCNN", "stgcnn_dup_results.xlsx", PAPER
+    a.data_root = STG_ROOT
+    a.outdir = os.path.join(STG_ROOT, "results_dup",
+                            f"author_k{'-'.join(map(str, a.ks))}_stride{a.stride}{'_strict' if a.strict else ''}")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"weight: 저장소 checkpoint/ (저자 사전학습)\n복제 수 k: {a.ks}   sigma: {a.sigmas}   "
+          f"장면 솎아내기: 1/{a.stride}   간격 끊긴 구간: {'제외' if a.strict else '포함(공식과 동일)'}\n결과: {a.outdir}")
+    R, S = [], []
+    for n in a.datasets:
+        r = run(n, a, dev)
+        if r:
+            R += r[0]; S += r[1]
+    if R:
+        M.save(R, S, a)
+PYEOF
+python3 -c "import ast; ast.parse(open('$HOME/Social-STGCNN/stgcnn_dup_official.py').read()); print('STGCNN 파일 OK')"
