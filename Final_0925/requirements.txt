@@ -1,0 +1,48 @@
+# =============================================================================
+# Near-duplicate robustness experiment - Python dependencies
+#
+# The three models need incompatible package versions, so the experiment uses
+# THREE separate Python environments. `bash run_all.sh` creates all of them
+# automatically (conda-forge) and installs exactly the versions below.
+# PyTorch wheels come from the official CUDA 11.8 index:
+#   https://download.pytorch.org/whl/cu118
+# =============================================================================
+
+# ---- Environment 1: sgan  (Python 3.8) ----------------------------------------
+# torch==2.0.1            (CUDA 11.8 build)
+# attrdict==2.0.0         (required by SGAN; does not work on Python >= 3.10)
+# numpy<1.25
+
+# ---- Environment 2: stgcnn  (Python 3.10) -------------------------------------
+# torch==2.0.1            (CUDA 11.8 build)
+# numpy<2
+# networkx==2.8.8         (Social-STGCNN uses nx.from_numpy_matrix, removed in 3.0)
+# scipy==1.11.4           (networkx 2.8.8 calls scipy.errstate, removed in 1.12)
+# tqdm
+
+# ---- Environment 3: agentformer  (Python 3.8) ---------------------------------
+# torch==2.0.1            (CUDA 11.8 build)
+# torchvision==0.15.2     (CUDA 11.8 build; imported by AgentFormer's map encoder)
+# numpy<1.25
+# scipy
+# pyyaml
+# easydict
+# glob2
+# six
+# tensorboard
+# opencv-python-headless
+# gdown                   (downloads the AgentFormer pretrained weights)
+
+# ---- Manual installation (equivalent to what run_all.sh does) -----------------
+# conda create -y -p envs/sgan        -c conda-forge python=3.8
+# conda create -y -p envs/stgcnn      -c conda-forge python=3.10
+# conda create -y -p envs/agentformer -c conda-forge python=3.8
+#
+# envs/sgan/bin/python -m pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+# envs/sgan/bin/python -m pip install attrdict==2.0.0 "numpy<1.25"
+#
+# envs/stgcnn/bin/python -m pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+# envs/stgcnn/bin/python -m pip install "numpy<2" networkx==2.8.8 scipy==1.11.4 tqdm
+#
+# envs/agentformer/bin/python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+# envs/agentformer/bin/python -m pip install "numpy<1.25" scipy pyyaml easydict glob2 six tensorboard opencv-python-headless gdown
